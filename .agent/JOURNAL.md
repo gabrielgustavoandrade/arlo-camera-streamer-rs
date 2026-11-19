@@ -527,3 +527,20 @@ Verified: actionlint + shellcheck clean; the plan script run through 16
           run everything). The job-level `if`s are reasoned, not run.
 Not done: Renovate config unchanged: main has no protection, so its
           default rebases only on conflict.
+
+## 2026-11-19 — Activation wedge: control thread per camera, bounded activation
+Seen:     A camera stuck in `activating`; the registry-wide tokio RwLock was
+          held across synchronous GStreamer calls (key-frame request = a
+          serialized event waiting on the encoder's locks) and the
+          orchestrator awaited `attach_live` inline with no deadline.
+Changed:  ADR 0011. Per-camera `CameraSlot` + `GstWorker` control thread
+          (queue 16, 5 s per call); key-frame request is an upstream
+          non-serialized event; probe uses try_lock; leg shutdown bounded
+          at 10 s; activation is a spawned task with a 50 s deadline, and
+          admin idle / offline / shutdown abort it
+          (`StateTransition::ActivationAborted`); runtime floor of 4
+          workers. Stress test `tests/registry_stress.rs` and
+          `branch-ci.yml` added.
+Verified: NOT compiled on the box that wrote it (no toolchain there); the
+          oracle is the branch-ci run on `fix/activation-deadlock`.
+Not done: C5 (pumps via spawn_blocking) and C6 (diagnostics) of the plan.
