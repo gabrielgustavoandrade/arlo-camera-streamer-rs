@@ -18,12 +18,13 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use bytes::Bytes;
 use chrono::Local;
 use tokio::sync::RwLock;
-use tracing::{debug, info, instrument, warn};
+use tracing::{debug, error, info, instrument, warn};
 
 use streamer_domain::camera::{CameraId, StreamName};
 use streamer_domain::config::{CameraConfig, OutputConfig, WebrtcConfig};
@@ -39,6 +40,10 @@ use crate::live_watch::setup_or_loss;
 use crate::pipeline_desc::{OutputBranches, build_output_branches};
 use crate::rtsp_relay::{RelayTls, RtspRelay};
 use crate::webrtc_pipeline::WebrtcLive;
+
+/// Longest the teardown of a live leg (its pipeline going to `Null`) may
+/// hold up a detach.
+const LEG_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Trait that the GStreamer-backed registry implements. The seam keeps
 /// the multiplexer testable without spinning up a real pipeline.
@@ -311,10 +316,16 @@ impl<R: PipelineRegistry> MediaMultiplexer for GstMediaMultiplexer<R> {
         // teardown blocks, and must hold up neither the runtime's worker
         // nor the other cameras' attach/detach.
         let leg = self.live.lock().await.remove(camera);
-        if let Some(mut leg) = leg
-            && let Err(e) = tokio::task::spawn_blocking(move || leg.shutdown()).await
-        {
-            warn!(error = %e, "live leg shutdown task failed");
+        if let Some(mut leg) = leg {
+            let stop = tokio::task::spawn_blocking(move || leg.shutdown());
+            match tokio::time::timeout(LEG_SHUTDOWN_TIMEOUT, stop).await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => warn!(error = %e, "live leg shutdown task failed"),
+                Err(_) => error!(
+                    timeout_secs = LEG_SHUTDOWN_TIMEOUT.as_secs(),
+                    "live leg shutdown still running after its bound; left on its blocking thread"
+                ),
+            }
         }
         res.map_err(Into::into)
     }
