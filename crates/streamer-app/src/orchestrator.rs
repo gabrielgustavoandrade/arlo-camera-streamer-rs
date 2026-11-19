@@ -72,7 +72,7 @@ use chrono::{Local, NaiveDateTime};
 use tokio::select;
 use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, info, instrument, trace, warn};
+use tracing::{debug, error, info, instrument, trace, warn};
 
 use streamer_domain::admin::CameraSnapshot;
 use streamer_domain::camera::{CameraId, StreamName};
@@ -129,6 +129,47 @@ const MIN_USEFUL_SESSION_SECS: i64 = 15;
 /// The trigger label of an admin wake: an operator's explicit request,
 /// not held after a capped session (it has its own interval).
 const ADMIN_WAKE_TRIGGER: &str = "admin-wake";
+
+/// Longest an activation may stay pending. The live leg bounds itself at
+/// 20 s (offer) + 5 s (SDP) + 20 s (first RTP); the margin lets its more
+/// specific error report first.
+const ACTIVATION_TIMEOUT: Duration = Duration::from_secs(50);
+/// How long an aborted attach gets to unwind before the detach runs anyway.
+const ATTACH_ABORT_GRACE: Duration = Duration::from_secs(2);
+/// Bound for one side effect of the camera task (detach, upstream teardown).
+const SIDE_EFFECT_TIMEOUT: Duration = Duration::from_secs(20);
+
+type AttachResult = Result<LiveSession, DomainError>;
+
+/// The attach of the activation in progress. Present exactly while the
+/// state is `Activating`.
+struct PendingAttach {
+    task: tokio::task::JoinHandle<AttachResult>,
+    deadline: Instant,
+    started: Instant,
+    source: LiveSource,
+}
+
+/// How an attach ended.
+enum AttachOutcome {
+    Done(AttachResult),
+    Crashed(String),
+    TimedOut,
+}
+
+impl AttachOutcome {
+    fn failure_reason(&self) -> String {
+        match self {
+            Self::Done(Err(e)) => e.to_string(),
+            Self::Done(Ok(_)) => "attach succeeded".to_string(),
+            Self::Crashed(e) => format!("attach task failed: {e}"),
+            Self::TimedOut => format!(
+                "activation timed out after {} s",
+                ACTIVATION_TIMEOUT.as_secs()
+            ),
+        }
+    }
+}
 
 /// Per-camera state-machine task.
 pub struct CameraOrchestrator {
@@ -202,6 +243,8 @@ pub struct CameraOrchestrator {
     /// Until when, after a probe, the camera's `idle` report is awaited
     /// in `Idle`; `None` outside a probe.
     probe_until: Option<Instant>,
+    /// The attach in progress, if any (see [`PendingAttach`]).
+    pending_attach: Option<PendingAttach>,
     signaler: Arc<dyn WebrtcSignaler>,
     thumbnails: Arc<dyn ArloThumbnailSource>,
     media: Arc<dyn MediaMultiplexer>,
@@ -285,6 +328,7 @@ impl CameraOrchestrator {
             probe_interval: (config.cooldown.user_view_probe_secs > 0)
                 .then(|| Duration::from_secs(config.cooldown.user_view_probe_secs)),
             probe_until: None,
+            pending_attach: None,
             last_session_end: None,
             motion_rearm_after: None,
             rearm_hold: Duration::from_secs(config.cooldown.debounce_secs),
@@ -374,6 +418,7 @@ impl CameraOrchestrator {
 
                 () = self.shutdown.cancelled() => {
                     info!("shutdown requested");
+                    self.abandon_activation().await;
                     self.handle_shutdown().await;
                     return;
                 }
@@ -393,6 +438,13 @@ impl CameraOrchestrator {
                         warn!(error = %e, "live-lost handling failed");
                     }
                 }
+                outcome = attach_finished(self.pending_attach.as_mut()) => {
+                    // Take the handle first: a finished `JoinHandle` must not
+                    // be polled again.
+                    if let Some(pending) = self.pending_attach.take() {
+                        self.finish_activation(pending, outcome).await;
+                    }
+                }
                 event = self.events.recv() => match event {
                     Some(event) => {
                         if let Err(e) = self.handle_event(event).await {
@@ -404,6 +456,7 @@ impl CameraOrchestrator {
                         // cancels the token on an upstream end) or it
                         // died. Either way leave nothing streaming.
                         warn!("event channel closed; exiting");
+                        self.abandon_activation().await;
                         self.handle_shutdown().await;
                         return;
                     }
@@ -448,11 +501,15 @@ impl CameraOrchestrator {
                 if reply.send(()).is_err() {
                     debug!("admin force-idle reply dropped");
                 }
-                if matches!(self.state, CameraState::Live | CameraState::Activating) {
-                    let signals = VecDeque::from([StateTransition::CooldownExpired]);
-                    if let Err(e) = self.process_signals(signals).await {
-                        warn!(error = %e, "force-idle failed");
-                    }
+                let signal = match self.state {
+                    CameraState::Live => Some(StateTransition::CooldownExpired),
+                    CameraState::Activating => Some(StateTransition::ActivationAborted),
+                    _ => None,
+                };
+                if let Some(signal) = signal
+                    && let Err(e) = self.process_signals(VecDeque::from([signal])).await
+                {
+                    warn!(error = %e, "force-idle failed");
                 }
             }
             AdminCommand::ManualWake { reply } => {
@@ -670,7 +727,9 @@ impl CameraOrchestrator {
         // and only for a pulse the budget let through: a pulse refused in
         // `Idle`, or one in BatteryProtect / Failed, would leave a stale
         // `live_since` that trips the hard cap right after the next attach.
-        let session_possible = in_session || self.state == CameraState::Idle;
+        let activating_motion = self.state == CameraState::Activating
+            && self.session_source == Some(LiveSource::Motion);
+        let session_possible = in_session || activating_motion || self.state == CameraState::Idle;
         if session_possible && matches!(signal, StateTransition::MotionDetected) {
             self.debouncer.on_motion(now());
         }
@@ -1013,6 +1072,13 @@ impl CameraOrchestrator {
             // loop-top publish alone would show the previous state until
             // this signal is fully handled.
             self.publish_snapshot();
+            // Leaving `Activating` on anything but the attach's own outcome
+            // (admin idle, offline, budget, shutdown): stop the attempt
+            // before the exit arm detaches. A no-op when the outcome itself
+            // brought us here.
+            if matches!(from, CameraState::Activating) {
+                self.cancel_pending_attach().await;
+            }
             let follow_ups = self.apply_state_change(&from, &to).await?;
             for f in follow_ups {
                 signals.push_back(f);
@@ -1041,20 +1107,20 @@ impl CameraOrchestrator {
         from: &CameraState,
         to: &CameraState,
     ) -> Result<Vec<StateTransition>, DomainError> {
-        let mut follow_ups = Vec::new();
+        let follow_ups = Vec::new();
         match (from, to) {
-            // Cold-start activation: kick off the async stream request.
+            // Cold-start activation: start the attach as a task of its own;
+            // its outcome comes back through the run loop.
             (CameraState::Idle, CameraState::Activating) => {
-                let follow = if self.session_source == Some(LiveSource::UserView) {
-                    self.start_user_view_relay().await
+                if self.session_source == Some(LiveSource::UserView) {
+                    self.start_user_view_relay();
                 } else {
                     self.budget.charge(
                         Local::now().naive_local(),
                         chrono::Duration::seconds(ACTIVATION_SURCHARGE_SECS),
                     );
-                    self.start_activation().await
-                };
-                follow_ups.extend(follow);
+                    self.start_activation();
+                }
             }
             // Activation succeeded. A relay of the user's view has no
             // cooldown and costs no battery of ours: it is not debounced
@@ -1075,7 +1141,7 @@ impl CameraOrchestrator {
             // whatever the attempt left behind, no backoff.
             (CameraState::Activating, CameraState::Idle | CameraState::BatteryProtect { .. }) => {
                 self.last_session_end = Some(now());
-                let _ = self.media.detach_live(&self.camera_id).await;
+                let _ = within("detach_live", self.media.detach_live(&self.camera_id)).await;
                 self.stop_arlo_live().await;
                 self.debouncer.on_idle();
             }
@@ -1089,7 +1155,7 @@ impl CameraOrchestrator {
                 // A failed attempt starts the manual-wake interval too, or a
                 // wake that keeps failing could repeat every backoff.
                 self.last_session_end = Some(now());
-                let _ = self.media.detach_live(&self.camera_id).await;
+                let _ = within("detach_live", self.media.detach_live(&self.camera_id)).await;
                 self.stop_arlo_live().await;
                 self.budget.on_live_ended(moment());
                 self.debouncer.on_idle();
@@ -1118,45 +1184,17 @@ impl CameraOrchestrator {
     /// WebRTC offer/answer round-trip (via `signaler`); the orchestrator
     /// only drives the splice and keeps teardown symmetric.
     ///
-    /// Raced against shutdown: an attach can take 40 s (offer, then the
-    /// first RTP), longer than the drain waits, and a session the gateway
-    /// already answered must still be torn down. The attach is
-    /// cancel-safe; the `Failed` exit detaches and tears down.
-    async fn start_activation(&mut self) -> Vec<StateTransition> {
-        let started = now();
-        let attach = self
-            .media
-            .attach_live(&self.camera_id, self.signaler.as_ref());
-        let Some(attached) = self.shutdown.run_until_cancelled(attach).await else {
-            info!("shutdown during the activation; releasing the camera");
-            return vec![StateTransition::Failure(
-                SHUTDOWN_DURING_ACTIVATION.to_string(),
-            )];
-        };
-        match attached {
-            Ok(session) => {
-                self.live = Some(session);
-                self.metrics.record_splice(
-                    &self.camera_id,
-                    SpliceOutcome::Success,
-                    elapsed_ms(started),
-                );
-                vec![StateTransition::LiveAttached]
-            }
-            Err(DomainError::CameraBusy(reason)) => {
-                info!(%reason, "camera busy with a user view in the Arlo app; not activating");
-                self.user_view_until = Some(now() + USER_VIEW_HOLD);
-                self.sync_user_view_notice().await;
-                vec![StateTransition::CameraBusy]
-            }
-            Err(e) => {
-                let latency = elapsed_ms(started);
-                warn!(error = %e, latency_ms = latency, "attach_live failed");
-                self.metrics
-                    .record_splice(&self.camera_id, SpliceOutcome::AttachFailed, latency);
-                vec![StateTransition::Failure(e.to_string())]
-            }
-        }
+    /// The attach runs as a task of its own, so this task keeps serving its
+    /// mailbox, admin commands and shutdown while it is pending, and the run
+    /// loop bounds it by [`ACTIVATION_TIMEOUT`]. The attach is cancel-safe;
+    /// every exit from `Activating` detaches and tears down.
+    fn start_activation(&mut self) {
+        let media = Arc::clone(&self.media);
+        let signaler = Arc::clone(&self.signaler);
+        let camera = self.camera_id.clone();
+        let attach = async move { media.attach_live(&camera, signaler.as_ref()).await };
+        let task = tokio::spawn(tracing::Instrument::in_current_span(attach));
+        self.track_attach(task, LiveSource::Motion);
     }
 
     /// Whether a report of the user's view should start a relay now: only
@@ -1181,37 +1219,101 @@ impl CameraOrchestrator {
     /// returns to idle without backoff and arms the retry guard; the idle
     /// frame keeps saying where the live picture is.
     ///
-    /// Raced against shutdown like [`Self::start_activation`]; the
+    /// Runs as a task of its own like [`Self::start_activation`]; the
     /// `Activating → Idle` exit then releases the relay.
-    async fn start_user_view_relay(&mut self) -> Vec<StateTransition> {
+    fn start_user_view_relay(&mut self) {
+        let media = Arc::clone(&self.media);
+        let user_views = Arc::clone(&self.user_views);
+        let camera = self.camera_id.clone();
+        let attach = async move {
+            let url = user_views.watch_along_url(&camera).await?;
+            media.attach_user_view(&camera, &url).await
+        };
+        let task = tokio::spawn(tracing::Instrument::in_current_span(attach));
+        self.track_attach(task, LiveSource::UserView);
+    }
+
+    /// Remember the attach in progress and its deadline.
+    fn track_attach(&mut self, task: tokio::task::JoinHandle<AttachResult>, source: LiveSource) {
         let started = now();
-        let attach = async {
-            let url = self.user_views.watch_along_url(&self.camera_id).await?;
-            self.media.attach_user_view(&self.camera_id, &url).await
-        };
-        let Some(attached) = self.shutdown.run_until_cancelled(attach).await else {
-            info!("shutdown while setting up the relay; releasing the camera");
-            return vec![StateTransition::UserViewUnavailable];
-        };
-        match attached {
-            Ok(session) => {
+        self.pending_attach = Some(PendingAttach {
+            task,
+            deadline: started + ACTIVATION_TIMEOUT,
+            started,
+            source,
+        });
+    }
+
+    /// Stop the attach in progress, if any, and give it a moment to unwind.
+    async fn cancel_pending_attach(&mut self) {
+        if let Some(pending) = self.pending_attach.take() {
+            stop_attach_task(pending.task).await;
+        }
+    }
+
+    /// Apply the outcome of the attach: the branches the inline code had,
+    /// plus the timeout.
+    async fn finish_activation(&mut self, pending: PendingAttach, outcome: AttachOutcome) {
+        let PendingAttach {
+            task,
+            started,
+            source,
+            ..
+        } = pending;
+        if matches!(outcome, AttachOutcome::TimedOut) {
+            stop_attach_task(task).await;
+        }
+        let latency = elapsed_ms(started);
+        let signal = match (source, outcome) {
+            (_, AttachOutcome::Done(Ok(session))) => {
                 self.live = Some(session);
-                self.metrics.record_splice(
-                    &self.camera_id,
-                    SpliceOutcome::Success,
-                    elapsed_ms(started),
-                );
-                info!("relaying the user's live view from the Arlo app");
-                vec![StateTransition::LiveAttached]
+                self.metrics
+                    .record_splice(&self.camera_id, SpliceOutcome::Success, latency);
+                if source == LiveSource::UserView {
+                    info!("relaying the user's live view from the Arlo app");
+                }
+                StateTransition::LiveAttached
             }
-            Err(e) => {
-                let latency = elapsed_ms(started);
-                warn!(error = %e, latency_ms = latency, "user view not relayed; idle frame keeps the notice");
+            (LiveSource::Motion, AttachOutcome::Done(Err(DomainError::CameraBusy(reason)))) => {
+                info!(%reason, "camera busy with a user view in the Arlo app; not activating");
+                self.user_view_until = Some(now() + USER_VIEW_HOLD);
+                self.sync_user_view_notice().await;
+                StateTransition::CameraBusy
+            }
+            (LiveSource::Motion, failed) => {
+                let reason = failed.failure_reason();
+                warn!(error = %reason, latency_ms = latency, "attach_live failed");
+                self.metrics
+                    .record_splice(&self.camera_id, SpliceOutcome::AttachFailed, latency);
+                StateTransition::Failure(reason)
+            }
+            (LiveSource::UserView, failed) => {
+                warn!(error = %failed.failure_reason(), latency_ms = latency, "user view not relayed; idle frame keeps the notice");
                 self.metrics
                     .record_splice(&self.camera_id, SpliceOutcome::AttachFailed, latency);
                 self.user_view_retry_after = Some(now() + USER_VIEW_RETRY);
-                vec![StateTransition::UserViewUnavailable]
+                StateTransition::UserViewUnavailable
             }
+        };
+        if let Err(e) = self.process_signals(VecDeque::from([signal])).await {
+            warn!(error = %e, "applying the attach outcome failed");
+        }
+    }
+
+    /// A pending attach must not outlive the task: leave `Activating` with
+    /// the signals the inline race against shutdown used to return.
+    async fn abandon_activation(&mut self) {
+        if self.pending_attach.is_none() {
+            return;
+        }
+        info!("shutdown during the activation; releasing the camera");
+        let signal = if self.session_source == Some(LiveSource::UserView) {
+            StateTransition::UserViewUnavailable
+        } else {
+            StateTransition::Failure(SHUTDOWN_DURING_ACTIVATION.to_string())
+        };
+        if let Err(e) = self.process_signals(VecDeque::from([signal])).await {
+            warn!(error = %e, "abandoning the activation failed");
         }
     }
 
@@ -1221,7 +1323,7 @@ impl CameraOrchestrator {
     /// adapter handles the missing-image case.
     async fn detach_and_refresh(&mut self) {
         self.last_session_end = Some(now());
-        if let Err(e) = self.media.detach_live(&self.camera_id).await {
+        if let Some(Err(e)) = within("detach_live", self.media.detach_live(&self.camera_id)).await {
             warn!(error = %e, "detach_live failed");
         }
         self.stop_arlo_live().await;
@@ -1256,7 +1358,9 @@ impl CameraOrchestrator {
         // races the shutdown is never acted upon.
         self.live = None;
         if matches!(self.state, CameraState::Live) {
-            if let Err(e) = self.media.detach_live(&self.camera_id).await {
+            if let Some(Err(e)) =
+                within("detach_live", self.media.detach_live(&self.camera_id)).await
+            {
                 warn!(error = %e, "detach on shutdown failed");
             }
             self.budget.on_live_ended(moment());
@@ -1272,7 +1376,7 @@ impl CameraOrchestrator {
     /// max-live, failure, or shutdown — can leave a WebRTC session
     /// draining the camera battery.
     async fn stop_arlo_live(&self) {
-        if let Err(e) = self.signaler.teardown(&self.camera_id).await {
+        if let Some(Err(e)) = within("teardown", self.signaler.teardown(&self.camera_id)).await {
             warn!(error = %e, "teardown failed (upstream session may linger)");
         }
     }
@@ -1305,6 +1409,47 @@ async fn maybe_sleep_until(deadline: Option<Instant>) {
     match deadline {
         Some(d) => tokio::time::sleep_until(tokio::time::Instant::from_std(d)).await,
         None => std::future::pending::<()>().await,
+    }
+}
+
+/// Resolves when the pending attach finishes or its deadline passes;
+/// never when there is none.
+async fn attach_finished(pending: Option<&mut PendingAttach>) -> AttachOutcome {
+    let Some(pending) = pending else {
+        return std::future::pending().await;
+    };
+    select! {
+        biased;
+        joined = &mut pending.task => match joined {
+            Ok(result) => AttachOutcome::Done(result),
+            Err(e) => AttachOutcome::Crashed(e.to_string()),
+        },
+        () = maybe_sleep_until(Some(pending.deadline)) => AttachOutcome::TimedOut,
+    }
+}
+
+/// Abort an attach and give it a moment to unwind, so the detach that
+/// follows finds nothing half-built. A task blocked in a synchronous call
+/// cannot be aborted: the grace period ends the wait.
+async fn stop_attach_task(task: tokio::task::JoinHandle<AttachResult>) {
+    task.abort();
+    if tokio::time::timeout(ATTACH_ABORT_GRACE, task).await.is_err() {
+        warn!("aborted attach still running after the grace period; detaching anyway");
+    }
+}
+
+/// Bound one side effect of the camera task. `None` when it ran out of time.
+async fn within<T>(op: &'static str, effect: impl std::future::Future<Output = T>) -> Option<T> {
+    match tokio::time::timeout(SIDE_EFFECT_TIMEOUT, effect).await {
+        Ok(out) => Some(out),
+        Err(_) => {
+            error!(
+                op,
+                timeout_secs = SIDE_EFFECT_TIMEOUT.as_secs(),
+                "side effect exceeded its bound; the camera task continues"
+            );
+            None
+        }
     }
 }
 
@@ -1352,6 +1497,7 @@ fn signal_label(s: &StateTransition) -> &'static str {
         StateTransition::UserViewEnded => "user-view-ended",
         StateTransition::UserViewUnavailable => "user-view-unavailable",
         StateTransition::UserViewProbe => "user-view-probe",
+        StateTransition::ActivationAborted => "activation-aborted",
     }
 }
 
@@ -1359,7 +1505,7 @@ fn signal_label(s: &StateTransition) -> &'static str {
 /// computed signal so the recorder gets a meaningful outcome:
 /// - in `Failed`: suppressed
 /// - signal diverted to `BudgetExhausted`: budget-exhausted
-/// - already live: absorbed (debouncer handles it)
+/// - already live or activating: absorbed (debouncer handles it)
 /// - else: triggered
 fn classify_motion(state: &CameraState, signal: &StateTransition) -> MotionOutcome {
     if matches!(signal, StateTransition::BudgetExhausted) {
@@ -1367,7 +1513,7 @@ fn classify_motion(state: &CameraState, signal: &StateTransition) -> MotionOutco
     }
     match state {
         CameraState::Failed { .. } => MotionOutcome::SuppressedFailed,
-        CameraState::Live => MotionOutcome::Absorbed,
+        CameraState::Live | CameraState::Activating => MotionOutcome::Absorbed,
         _ => MotionOutcome::Triggered,
     }
 }
@@ -1579,6 +1725,8 @@ mod tests {
         notices: Mutex<Vec<bool>>,
         /// When `true`, `set_user_view_notice` records the call and fails.
         fail_notices: std::sync::atomic::AtomicBool,
+        /// When `true`, `attach_live` and `attach_user_view` never complete.
+        hang_attach: std::sync::atomic::AtomicBool,
     }
 
     #[derive(Debug, PartialEq, Eq)]
@@ -1654,6 +1802,11 @@ mod tests {
             self.fail_notices
                 .store(fail, std::sync::atomic::Ordering::Relaxed);
         }
+        /// Make every attach hang for ever (or complete again).
+        fn hang_attach(&self, hang: bool) {
+            self.hang_attach
+                .store(hang, std::sync::atomic::Ordering::Relaxed);
+        }
         /// Report the `idx`-th session (0-based, in attach order) lost.
         /// Returns what the notifier returned (`false` = unobservable).
         async fn fail_live(&self, idx: usize, reason: LiveLossReason) -> bool {
@@ -1676,6 +1829,9 @@ mod tests {
             camera: &CameraId,
             signaler: &dyn WebrtcSignaler,
         ) -> Result<LiveSession, DomainError> {
+            if self.hang_attach.load(std::sync::atomic::Ordering::Relaxed) {
+                std::future::pending::<()>().await;
+            }
             // Mirror the real adapter: the media leg owns the WebRTC
             // offer/answer round-trip. Surfacing the negotiate error as
             // an attach failure is exactly the production contract.
@@ -1729,6 +1885,9 @@ mod tests {
             _camera: &CameraId,
             _url: &streamer_domain::stream::WatchAlongUrl,
         ) -> Result<LiveSession, DomainError> {
+            if self.hang_attach.load(std::sync::atomic::Ordering::Relaxed) {
+                std::future::pending::<()>().await;
+            }
             self.events.lock().await.push(MediaCall::AttachUserView);
             let (session, notifier) = LiveSession::new();
             if self
@@ -3590,6 +3749,136 @@ mod tests {
 
         token.cancel();
         handle.await.unwrap();
+    }
+
+    // ---------- An attach that never completes ----------
+
+    /// The camera task keeps draining its mailbox while the attach hangs,
+    /// the activation is cut at its deadline, and the camera recovers.
+    #[tokio::test(start_paused = true)]
+    async fn hanging_activation_times_out_recovers_and_keeps_draining() {
+        let cfg = camera_cfg(60, 300);
+        let sr = StubSignaler::with_responses(vec![]);
+        let media = RecordingMedia::new();
+        media.hang_attach(true);
+        let (orch, tx, token) = build(&cfg, sr.clone(), media.clone());
+        let snapshots = orch.snapshots();
+        let handle = tokio::spawn(orch.run());
+
+        send(&tx, motion()).await;
+        assert_eq!(snapshots.borrow().state, "activating");
+        for _ in 0..96 {
+            tx.try_send(motion())
+                .expect("mailbox drained during the attach");
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+
+        tokio::time::sleep(ACTIVATION_TIMEOUT + Duration::from_millis(500)).await;
+        assert_eq!(snapshots.borrow().state, "failed");
+        assert!(media.calls().await.contains(&MediaCall::DetachLive));
+        assert!(sr.stop_count().await >= 1);
+
+        media.hang_attach(false);
+        tokio::time::sleep(Duration::from_secs(61)).await;
+        assert_eq!(snapshots.borrow().state, "idle");
+        send(&tx, motion()).await;
+        assert_eq!(snapshots.borrow().state, "live");
+
+        token.cancel();
+        handle.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn admin_idle_interrupts_a_hanging_activation() {
+        let cfg = camera_cfg(60, 300);
+        let sr = StubSignaler::with_responses(vec![]);
+        let media = RecordingMedia::new();
+        media.hang_attach(true);
+        let (orch, tx, admin_tx, token) = build_with_admin(&cfg, sr.clone(), media.clone());
+        let snapshots = orch.snapshots();
+        let handle = tokio::spawn(orch.run());
+
+        send(&tx, motion()).await;
+        assert_eq!(snapshots.borrow().state, "activating");
+        let (reply, answered) = tokio::sync::oneshot::channel();
+        admin_tx
+            .send(crate::admin::AdminCommand::ForceIdle { reply })
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), answered)
+            .await
+            .expect("the admin arm is served during the attach")
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        assert_eq!(snapshots.borrow().state, "idle");
+        assert!(media.calls().await.contains(&MediaCall::DetachLive));
+        assert!(sr.stop_count().await >= 1);
+
+        token.cancel();
+        handle.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn offline_during_activation_fails_it_and_detaches() {
+        let cfg = camera_cfg(60, 300);
+        let sr = StubSignaler::with_responses(vec![]);
+        let media = RecordingMedia::new();
+        media.hang_attach(true);
+        let (orch, tx, token) = build(&cfg, sr.clone(), media.clone());
+        let snapshots = orch.snapshots();
+        let handle = tokio::spawn(orch.run());
+
+        send(&tx, motion()).await;
+        assert_eq!(snapshots.borrow().state, "activating");
+        send(&tx, offline()).await;
+
+        assert_eq!(snapshots.borrow().state, "failed");
+        assert!(media.calls().await.contains(&MediaCall::DetachLive));
+
+        token.cancel();
+        handle.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn pulses_during_activation_are_absorbed() {
+        let cfg = camera_cfg(60, 300);
+        let (sr, release) = HeldSignaler::new();
+        let media = RecordingMedia::new();
+        let (mut orch, tx, token) = build(&cfg, sr, media.clone());
+        let pulses = Arc::new(PulseSpy::default());
+        orch.metrics = pulses.clone();
+        let snapshots = orch.snapshots();
+        let handle = tokio::spawn(orch.run());
+
+        send(&tx, motion()).await;
+        send(&tx, motion()).await;
+        send(&tx, motion()).await;
+        assert_eq!(snapshots.borrow().state, "activating");
+        let _ = release.send(());
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert_eq!(snapshots.borrow().state, "live");
+
+        let seen = pulses.0.lock().unwrap();
+        assert!(matches!(seen[0].1, MotionOutcome::Triggered));
+        assert!(
+            seen[1..]
+                .iter()
+                .all(|(_, outcome)| matches!(outcome, MotionOutcome::Absorbed)),
+            "pulses during the activation are absorbed"
+        );
+        drop(seen);
+
+        token.cancel();
+        handle.await.unwrap();
+    }
+
+    #[test]
+    fn signal_label_covers_activation_aborted() {
+        assert_eq!(
+            signal_label(&StateTransition::ActivationAborted),
+            "activation-aborted"
+        );
     }
 
     // ---------- now_local just returns naive local time ----------
