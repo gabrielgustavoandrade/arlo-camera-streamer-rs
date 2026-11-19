@@ -3862,15 +3862,16 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(10)).await;
         assert_eq!(snapshots.borrow().state, "live");
 
-        let seen = pulses.0.lock().unwrap();
-        assert!(matches!(seen[0].1, MotionOutcome::Triggered));
-        assert!(
-            seen[1..]
-                .iter()
-                .all(|(_, outcome)| matches!(outcome, MotionOutcome::Absorbed)),
-            "pulses during the activation are absorbed"
-        );
-        drop(seen);
+        {
+            let seen = pulses.0.lock().unwrap();
+            assert!(matches!(seen[0].1, MotionOutcome::Triggered));
+            assert!(
+                seen[1..]
+                    .iter()
+                    .all(|(_, outcome)| matches!(outcome, MotionOutcome::Absorbed)),
+                "pulses during the activation are absorbed"
+            );
+        }
 
         token.cancel();
         handle.await.unwrap();
