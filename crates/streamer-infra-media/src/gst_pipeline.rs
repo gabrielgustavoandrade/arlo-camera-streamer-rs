@@ -466,6 +466,7 @@ impl GstPipelineRegistry {
     /// Drop all mount points (called during graceful shutdown).
     #[allow(
         clippy::unused_async,
+        clippy::unused_async_trait_impl,
         reason = "public signature kept: callers await it"
     )]
     pub async fn shutdown(&self) {
