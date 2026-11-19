@@ -82,6 +82,10 @@ const ADMIN_TOKEN_ENV: &str = "STREAMER_ADMIN_TOKEN";
 const SHUTDOWN_STAGE_TIMEOUT: Duration = Duration::from_secs(8);
 /// How long the runtime waits for blocking tasks at exit.
 const RUNTIME_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
+/// Fewest async workers the runtime starts, whatever the CPU quota says.
+/// On a one-core container the default is a single worker: any task that
+/// stalls it would stop every camera, the admin API and the health check.
+const MIN_RUNTIME_WORKERS: usize = 4;
 /// The log filter when `RUST_LOG` is unset.
 const DEFAULT_LOG_FILTER: &str = "info,arlo_camera_streamer=debug";
 /// The log filter when `RUST_LOG` is set but does not parse.
@@ -152,7 +156,12 @@ enum Command {
 }
 
 fn main() -> Result<()> {
+    let workers = std::thread::available_parallelism()
+        .map_or(MIN_RUNTIME_WORKERS, std::num::NonZeroUsize::get)
+        .max(MIN_RUNTIME_WORKERS);
     let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(workers)
+        .thread_name("streamer-rt")
         .enable_all()
         .build()
         .context("failed to start the async runtime")?;
