@@ -194,7 +194,9 @@ fn small_jpeg() -> Vec<u8> {
         .expect("jpeg appsink")
         .downcast::<gst_app::AppSink>()
         .expect("appsink type");
-    pipeline.set_state(gst::State::Playing).expect("jpeg -> Playing");
+    pipeline
+        .set_state(gst::State::Playing)
+        .expect("jpeg -> Playing");
     let sample = sink
         .try_pull_sample(gst::ClockTime::from_seconds(5))
         .expect("a jpeg sample");
@@ -297,8 +299,7 @@ fn host_port(url: &str) -> String {
 /// never plays.
 fn half_open_loop(url: &str, ctx: &Ctx, seed: u64) {
     let mut rng = Rng::new(seed);
-    let request =
-        format!("DESCRIBE {url} RTSP/1.0\r\nCSeq: 1\r\nAccept: application/sdp\r\n\r\n");
+    let request = format!("DESCRIBE {url} RTSP/1.0\r\nCSeq: 1\r\nAccept: application/sdp\r\n\r\n");
     while !ctx.should_stop() {
         if let Ok(mut stream) = TcpStream::connect(host_port(url)) {
             let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));

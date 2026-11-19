@@ -464,7 +464,10 @@ impl GstPipelineRegistry {
     }
 
     /// Drop all mount points (called during graceful shutdown).
-    #[allow(clippy::unused_async, reason = "public signature kept: callers await it")]
+    #[allow(
+        clippy::unused_async,
+        reason = "public signature kept: callers await it"
+    )]
     pub async fn shutdown(&self) {
         let drained: Vec<(CameraId, Arc<CameraSlot>)> = write(&self.cameras).drain().collect();
         for (cam, slot) in drained {
@@ -1550,7 +1553,11 @@ mod tests {
 
         release.send(()).unwrap();
         let next = worker.run("next", || 7_u32).await;
-        assert_eq!(next.unwrap(), 7, "the thread survived and runs the next call");
+        assert_eq!(
+            next.unwrap(),
+            7,
+            "the thread survived and runs the next call"
+        );
     }
 
     /// Behind a stuck call only `GST_WORKER_QUEUE` more may wait; the next

@@ -335,7 +335,10 @@ mod tests {
     #[test]
     fn activating_aborted_returns_idle() {
         assert_eq!(
-            transition(&CameraState::Activating, &StateTransition::ActivationAborted),
+            transition(
+                &CameraState::Activating,
+                &StateTransition::ActivationAborted
+            ),
             CameraState::Idle
         );
     }

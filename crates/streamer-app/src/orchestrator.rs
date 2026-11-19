@@ -1433,7 +1433,10 @@ async fn attach_finished(pending: Option<&mut PendingAttach>) -> AttachOutcome {
 /// cannot be aborted: the grace period ends the wait.
 async fn stop_attach_task(task: tokio::task::JoinHandle<AttachResult>) {
     task.abort();
-    if tokio::time::timeout(ATTACH_ABORT_GRACE, task).await.is_err() {
+    if tokio::time::timeout(ATTACH_ABORT_GRACE, task)
+        .await
+        .is_err()
+    {
         warn!("aborted attach still running after the grace period; detaching anyway");
     }
 }
