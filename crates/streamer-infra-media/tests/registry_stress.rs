@@ -29,6 +29,7 @@ use gstreamer as gst;
 use gstreamer::prelude::*;
 use gstreamer_app as gst_app;
 
+use streamer_domain::MediaMultiplexer;
 use streamer_domain::camera::CameraId;
 use streamer_domain::config::WebrtcConfig;
 use streamer_infra_media::{GstPipelineRegistry, LiveSinks, MediaError, PipelineRegistry};
