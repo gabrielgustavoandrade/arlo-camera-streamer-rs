@@ -41,6 +41,11 @@ const ELEMENTS: &[&str] = &[
 
 pub const CAMERA: &str = "IT_CAM";
 pub const STREAM: &str = "it_cam";
+/// The second camera of [`Stack::pair`].
+#[allow(dead_code)]
+pub const CAMERA2: &str = "IT_CAM2";
+#[allow(dead_code)]
+pub const STREAM2: &str = "it_cam2";
 
 /// Initialise GStreamer and report whether every element the tests
 /// need is installed. Skips (returns `false`) when one is missing,
@@ -66,7 +71,13 @@ pub fn gstreamer_ready() -> bool {
 /// The production media stack for one camera, on an ephemeral RTSP port.
 pub struct Stack {
     pub media: GstMediaMultiplexer<GstPipelineRegistry>,
+    /// The registry behind `media`, for tests that call it directly.
+    #[allow(dead_code)]
+    pub registry: Arc<GstPipelineRegistry>,
     pub camera: CameraId,
+    /// Every camera of the stack (`camera` is the first).
+    #[allow(dead_code)]
+    pub cameras: Vec<CameraId>,
     server: Arc<RtspServer>,
     /// This stack's own: a thumbnail one test stores must not become the
     /// next test's idle picture (a media loads the stored one when built).
@@ -92,7 +103,18 @@ impl Stack {
         Self::with_outputs(webrtc, Some(hls))
     }
 
+    /// ONE server, ONE registry and ONE multiplexer with two cameras
+    /// (`IT_CAM` / `it_cam` and `IT_CAM2` / `it_cam2`).
+    #[allow(dead_code)]
+    pub fn pair(webrtc: WebrtcConfig) -> Self {
+        Self::build(webrtc, None, &[(CAMERA, STREAM), (CAMERA2, STREAM2)])
+    }
+
     fn with_outputs(webrtc: WebrtcConfig, hls: Option<HlsOutput>) -> Self {
+        Self::build(webrtc, hls, &[(CAMERA, STREAM)])
+    }
+
+    fn build(webrtc: WebrtcConfig, hls: Option<HlsOutput>, specs: &[(&str, &str)]) -> Self {
         let server = RtspServer::start("127.0.0.1:0").expect("rtsp server");
         let stack = STACKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let thumbnails =
@@ -107,15 +129,19 @@ impl Stack {
             ),
             thumbnails.clone(),
         ));
-        let camera = CameraId::new(CAMERA);
-        let cameras = [CameraConfig {
-            arlo_device_id: camera.clone(),
-            stream_name: StreamName::parse(STREAM).expect("stream name"),
-            codec_hint: None,
-            cooldown: CooldownConfig::default(),
-            video_encoder: None,
-            bitrate_kbps: None,
-        }];
+        let camera = CameraId::new(specs[0].0);
+        let camera_ids: Vec<CameraId> = specs.iter().map(|(id, _)| CameraId::new(*id)).collect();
+        let cameras: Vec<CameraConfig> = specs
+            .iter()
+            .map(|(id, stream)| CameraConfig {
+                arlo_device_id: CameraId::new(*id),
+                stream_name: StreamName::parse(stream).expect("stream name"),
+                codec_hint: None,
+                cooldown: CooldownConfig::default(),
+                video_encoder: None,
+                bitrate_kbps: None,
+            })
+            .collect();
         let output = OutputConfig {
             rtsp: RtspOutput {
                 bind: "127.0.0.1:0".to_string(),
@@ -128,7 +154,7 @@ impl Stack {
             admin_bind: "127.0.0.1:0".to_string(),
         };
         let media = GstMediaMultiplexer::new(
-            registry,
+            Arc::clone(&registry),
             output,
             webrtc,
             &cameras,
@@ -139,7 +165,9 @@ impl Stack {
         );
         Self {
             media,
+            registry,
             camera,
+            cameras: camera_ids,
             server,
             thumbnails,
         }
@@ -157,8 +185,13 @@ impl Stack {
 
     /// The camera's RTSP URL on the bound port.
     pub fn url(&self) -> String {
+        self.url_of(STREAM)
+    }
+
+    /// The RTSP URL of the stream `stream` on the bound port.
+    pub fn url_of(&self, stream: &str) -> String {
         let port = self.server.bound_port().expect("rtsp server bound");
-        format!("rtsp://127.0.0.1:{port}/{STREAM}")
+        format!("rtsp://127.0.0.1:{port}/{stream}")
     }
 }
 

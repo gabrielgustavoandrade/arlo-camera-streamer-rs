@@ -17,6 +17,7 @@ real camera is recorded in [`../VALIDATION.md`](../VALIDATION.md).
 | [0008](./0008-video-encoder-selection.md) | Choosing the H.264 encoder per host (`auto`) | accepted | 2026-10-03 |
 | [0009](./0009-mqtt-home-assistant.md) | Camera state over MQTT for Home Assistant | accepted | 2026-10-10 |
 | [0010](./0010-idle-picture-drawn-once-a-second.md) | The idle picture is drawn once a second, not every frame | accepted | 2026-10-11 |
+| [0011](./0011-media-control-thread-and-bounded-activation.md) | A control thread per camera for GStreamer, and a bounded activation | accepted | 2026-11-19 |
 
 ## Writing one
 

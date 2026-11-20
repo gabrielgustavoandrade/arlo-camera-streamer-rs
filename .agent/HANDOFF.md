@@ -163,6 +163,14 @@ dates and log evidence). Update that file, not this section, after a gate.
 
 Verified in production; do not rediscover:
 
+- **Never hold a lock across a GStreamer call (ADR 0011, 2026-11-19).** The
+  registry keeps per-camera `CameraSlot`s; blocking calls go through the
+  camera's `GstWorker` control thread (5 s timeout). Lock order:
+  `cameras` → `control` → `wiring` → `live_switch`. The key-frame request is
+  an upstream non-serialized event; a serialized one waits on the encoder's
+  locks. The activation is a tracked task with a 50 s deadline. This fix
+  was written without a compiler: confirm the branch-ci run before trusting it.
+
 - **`audiomixer`, not a second `input-selector`, for audio.** A second
   selector stalls `gst-rtsp-server`'s media-prepare. Working since `b4c5553`.
 - **`avenc_aac` requires `F32LE`.** `S16LE` yields "not-negotiated".

@@ -26,6 +26,10 @@
 //! orchestrator relays again when no `idle` report follows. It emits
 //! `UserViewEnded` and `UserViewProbe` only for a relay session.
 //!
+//! `ActivationAborted` is an activation called off by the operator (admin
+//! idle): `Activating → Idle` without backoff, `(ignored)` in every other
+//! state (it is not a column of the table above).
+//!
 //! `CameraBusy` (ADR 0005) is an attach refused because the user is
 //! watching the camera in the Arlo app. It returns to `Idle` without the
 //! `Failed` backoff: nothing is broken, the camera is simply taken.
@@ -74,7 +78,7 @@ pub fn transition(state: &CameraState, signal: &StateTransition) -> CameraState 
 
         // ---------- From Activating ----------
         (S::Activating, T::LiveAttached) => S::Live,
-        (S::Activating, T::CameraBusy | T::UserViewUnavailable) => S::Idle,
+        (S::Activating, T::CameraBusy | T::UserViewUnavailable | T::ActivationAborted) => S::Idle,
         (S::Activating, T::Failure(reason)) => fresh_failed(reason),
         (S::Activating, T::BudgetExhausted) => battery_protect(),
         (S::Activating, _) => S::Activating,
@@ -326,6 +330,29 @@ mod tests {
         #[case] signal: StateTransition,
     ) {
         assert_eq!(transition(&state, &signal), state);
+    }
+
+    #[test]
+    fn activating_aborted_returns_idle() {
+        assert_eq!(
+            transition(
+                &CameraState::Activating,
+                &StateTransition::ActivationAborted
+            ),
+            CameraState::Idle
+        );
+    }
+
+    #[rstest]
+    #[case(CameraState::Idle)]
+    #[case(live())]
+    #[case(failed(1))]
+    #[case(battery())]
+    fn activation_aborted_is_ignored_elsewhere(#[case] state: CameraState) {
+        assert_eq!(
+            transition(&state, &StateTransition::ActivationAborted),
+            state
+        );
     }
 
     // ---------- CameraBusy (ADR 0005) ----------

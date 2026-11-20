@@ -37,8 +37,41 @@
 //!    for the first decoded raw buffer, flips `active-pad = sink_1`,
 //!    and force-key-units the encoder. The probe self-removes.
 //! 4. [`detach_live_sink`](PipelineRegistry::detach_live_sink) flips `active-pad = sink_0`
-//!    synchronously, force-key-units the encoder, and aborts the
-//!    live pump.
+//!    on the camera's control thread, asks the encoder for a key frame
+//!    (an upstream event that waits for no lock), and aborts the live
+//!    pumps.
+//!
+//! ## Locking
+//!
+//! Nothing one camera does waits on another camera's lock, thread or media,
+//! and no lock of ours is held across a `GStreamer` call, a log call, the
+//! drop of a `GStreamer` object or an `.await`.
+//!
+//! | Lock | Kind | Guards | Taken by |
+//! |------|------|--------|----------|
+//! | `GstPipelineRegistry.cameras` | std `RwLock` | map `CameraId` → `Arc<CameraSlot>` | async callers, for the map operation only |
+//! | `CameraSlot.control` | std `Mutex` | idle kind, last thumbnail, session, HLS | async callers; plain field updates only |
+//! | `CameraSlot.wiring` | std `Mutex` | `Option<LiveWiring>` | async callers, control thread, pumps, `media-configure`, `unprepared`; clone / replace / take only, old values dropped after release |
+//! | `CameraSlot.caption` | std `Mutex` | `Option<String>` | async callers, `media-configure`; clone / assign only |
+//! | `LiveWiring.live_switch` | std `Mutex` | `Option<PadProbeId>` | control thread and `media-configure` (held over `add_probe` / `remove_probe`, which take only the pad's object lock); the probe callback only `try_lock`s |
+//!
+//! Order: `cameras` → `control` → `wiring` → `live_switch`; in practice only
+//! `live_switch` around `add_probe` / `remove_probe` is nested.
+//!
+//! Rules:
+//!
+//! - Every `GStreamer` call the async side makes on a camera's media runs on
+//!   that camera's own control thread (`GstWorker`, FIFO), never on a tokio
+//!   worker. The async side waits for the reply with a timeout
+//!   (`GST_CALL_TIMEOUT`): a blocked call costs one named thread and
+//!   returns an error.
+//! - Callbacks on `GStreamer` threads (`media-configure`, `unprepared`, the
+//!   pad probe) never wait on anything an async task can hold: they snapshot
+//!   and release, or `try_lock`.
+//! - No call that takes a `GStreamer` state or stream lock is made from the
+//!   probe callback or from the detach path: the key frame is requested with
+//!   a non-serialized upstream event on the encoder's src pad
+//!   (`request_keyframe`).
 //!
 //! Media lifecycle vs live session: gst-rtsp-server builds the media
 //! when the first client connects and unprepares it after the last one
@@ -71,7 +104,8 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex as StdMutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex as StdMutex, MutexGuard, PoisonError, RwLock as StdRwLock};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -81,8 +115,8 @@ use gstreamer::prelude::*;
 use gstreamer_app as gst_app;
 use gstreamer_rtsp_server::RTSPMedia;
 use gstreamer_rtsp_server::prelude::*;
-use tokio::sync::{RwLock, mpsc};
-use tracing::{debug, info, instrument, warn};
+use tokio::sync::mpsc;
+use tracing::{debug, error, info, instrument, warn};
 
 use streamer_domain::camera::CameraId;
 use streamer_domain::thumbnail::check_thumbnail;
@@ -156,14 +190,107 @@ struct LiveSession {
     aac: tokio::task::JoinHandle<()>,
 }
 
+impl LiveSession {
+    /// Stop the three pumps.
+    fn abort(&self) {
+        self.video.abort();
+        self.audio.abort();
+        self.aac.abort();
+    }
+}
+
+/// Longest one control call on a camera's media may take before its caller
+/// gives up.
+const GST_CALL_TIMEOUT: Duration = Duration::from_secs(5);
+/// Control calls that may queue behind a slow one before new ones are
+/// refused.
+const GST_WORKER_QUEUE: usize = 16;
+
+/// One call made on a camera's control thread.
+type GstJob = Box<dyn FnOnce() + Send + 'static>;
+
+/// One thread per camera: it makes every `GStreamer` call the async side
+/// needs on that camera's media, in order.
+struct GstWorker {
+    tx: std::sync::mpsc::SyncSender<GstJob>,
+}
+
+impl GstWorker {
+    fn spawn(camera: &CameraId) -> Result<Self, MediaError> {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<GstJob>(GST_WORKER_QUEUE);
+        std::thread::Builder::new()
+            .name(format!("gst-ctl-{camera}"))
+            .spawn(move || {
+                // Ends when the registry drops the camera (the sender closes).
+                while let Ok(job) = rx.recv() {
+                    job();
+                }
+            })
+            .map_err(|e| MediaError::Pipeline(format!("media control thread for {camera}: {e}")))?;
+        Ok(Self { tx })
+    }
+
+    /// Run `f` on the control thread and wait for its result, at most
+    /// [`GST_CALL_TIMEOUT`].
+    async fn run<T, F>(&self, op: &'static str, f: F) -> Result<T, MediaError>
+    where
+        T: Send + 'static,
+        F: FnOnce() -> T + Send + 'static,
+    {
+        self.run_within(op, GST_CALL_TIMEOUT, f).await
+    }
+
+    /// Like [`run`](Self::run) with an explicit bound. A call that outlives
+    /// its caller still runs to completion, in order.
+    async fn run_within<T, F>(
+        &self,
+        op: &'static str,
+        limit: Duration,
+        f: F,
+    ) -> Result<T, MediaError>
+    where
+        T: Send + 'static,
+        F: FnOnce() -> T + Send + 'static,
+    {
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        let span = tracing::Span::current();
+        let job: GstJob = Box::new(move || {
+            let _entered = span.enter();
+            let started = std::time::Instant::now();
+            let out = f();
+            let took = started.elapsed();
+            if took > limit {
+                warn!(op, took = ?took, "media control call returned after its caller gave up");
+            }
+            let _ = reply_tx.send(out);
+        });
+        self.tx.try_send(job).map_err(|e| match e {
+            std::sync::mpsc::TrySendError::Full(_) => MediaError::Pipeline(format!(
+                "{op}: media control queue full (an earlier call on this camera is stuck)"
+            )),
+            std::sync::mpsc::TrySendError::Disconnected(_) => {
+                MediaError::Pipeline(format!("{op}: media control thread stopped"))
+            }
+        })?;
+        match tokio::time::timeout(limit, reply_rx).await {
+            Ok(Ok(out)) => Ok(out),
+            Ok(Err(_)) => Err(MediaError::Pipeline(format!(
+                "{op}: media control thread dropped the call"
+            ))),
+            Err(_) => {
+                error!(op, limit = ?limit, "media control call still running after its bound: a GStreamer call is blocked");
+                Err(MediaError::Pipeline(format!(
+                    "{op}: no answer within {} ms",
+                    limit.as_millis()
+                )))
+            }
+        }
+    }
+}
+
 /// Per-camera state owned by [`GstPipelineRegistry`].
-struct CameraEntry {
+struct CameraSlot {
     mount_path: String,
-    idle: IdleKind,
-    /// Last known thumbnail JPEG. Applied to the idle overlay in
-    /// `refresh_thumbnail`; `GET /admin/cameras/{id}/thumbnail.jpg`
-    /// serves it.
-    last_thumbnail: Option<Bytes>,
     /// Set when gst-rtsp-server constructs a media for this factory.
     /// Read by `attach_live_sink` to find the appsrc + selector pads.
     /// `StdMutex` so the `GLib` callback (sync) and tokio tasks (which
@@ -173,15 +300,67 @@ struct CameraEntry {
     /// `media-configure` hook to arm the live switch on a media built in
     /// the middle of a session.
     live_active: Arc<AtomicBool>,
-    /// Active live ingestion if any.
-    session: Option<LiveSession>,
     /// Caption the idle frame should show, when it differs from the one
     /// in the launch string (`None`). Read by the `media-configure` hook
     /// so a media built later shows it too.
     caption: CaptionSlot,
+    /// The thread that makes this camera's `GStreamer` calls.
+    worker: GstWorker,
+    control: StdMutex<CameraControl>,
+}
+
+/// The plain bookkeeping of a camera. Never locked across a `GStreamer`
+/// call.
+struct CameraControl {
+    idle: IdleKind,
+    /// Last known thumbnail JPEG. Applied to the idle overlay in
+    /// `refresh_thumbnail`; `GET /admin/cameras/{id}/thumbnail.jpg`
+    /// serves it.
+    last_thumbnail: Option<Bytes>,
+    /// Active live ingestion if any.
+    session: Option<LiveSession>,
     /// HLS segmenter when `[output.hls]` is set (ADR 0006). Held for its
     /// lifetime: dropping it stops the segmenter.
     _hls: Option<HlsSegmenter>,
+}
+
+impl CameraSlot {
+    /// Claim the live session and start its pumps.
+    fn begin_session(&self, camera: &CameraId) -> Result<LiveSinks, MediaError> {
+        let mut control = lock(&self.control);
+        if control.session.is_some() {
+            return Err(MediaError::Pipeline(format!(
+                "camera {camera} already in live mode"
+            )));
+        }
+        let (sinks, rxs) = LiveSinks::new();
+        let LiveSinkReceivers { video, audio, aac } = rxs;
+        // Flag first, then look: a media configured concurrently either
+        // sees the flag (and arms itself) or is already in the slot.
+        self.live_active.store(true, Ordering::SeqCst);
+        control.session = Some(LiveSession {
+            video: spawn_live_pump(video, self.wiring.clone(), video_appsrc, "video"),
+            // Audio has no idle↔live selector — the audiomixer blends the
+            // live Opus onto silence; a media without the audio appsrc
+            // (pre-8b launch) simply discards it.
+            audio: spawn_live_pump(audio, self.wiring.clone(), audio_appsrc, "audio"),
+            aac: spawn_aac_pump(aac, self.wiring.clone()),
+        });
+        Ok(sinks)
+    }
+
+    /// Release the live session, if any. Idempotent. Refreshes the overlay
+    /// clock so the standby timestamp updates the next time the synthetic
+    /// IDR cycle inlines a frame.
+    fn end_session(&self) -> Option<LiveSession> {
+        let mut control = lock(&self.control);
+        control.idle = GstPipelineRegistry::refresh_overlay_timestamp(&control.idle);
+        let session = control.session.take()?;
+        // Clear the flag before flipping back, so a media configured from
+        // now on starts (and stays) on the idle branch.
+        self.live_active.store(false, Ordering::SeqCst);
+        Some(session)
+    }
 }
 
 /// The idle caption requested for a camera, shared with its
@@ -209,7 +388,19 @@ pub struct GstPipelineRegistry {
     /// Directory holding the per-camera snapshot JPEGs the idle overlay
     /// loads; prepared by [`prepare_thumbnail_dir`] before this exists.
     thumbnail_dir: PathBuf,
-    state: RwLock<HashMap<CameraId, CameraEntry>>,
+    /// Held only to clone a slot out or to change the map, never across a
+    /// `GStreamer` call or an `.await`.
+    cameras: StdRwLock<HashMap<CameraId, Arc<CameraSlot>>>,
+}
+
+/// Read-lock a map, recovering from a poisoned lock like [`lock`].
+fn read<T>(l: &StdRwLock<T>) -> std::sync::RwLockReadGuard<'_, T> {
+    l.read().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Write-lock a map, recovering from a poisoned lock like [`lock`].
+fn write<T>(l: &StdRwLock<T>) -> std::sync::RwLockWriteGuard<'_, T> {
+    l.write().unwrap_or_else(PoisonError::into_inner)
 }
 
 impl GstPipelineRegistry {
@@ -222,8 +413,16 @@ impl GstPipelineRegistry {
             server,
             encoders,
             thumbnail_dir,
-            state: RwLock::new(HashMap::new()),
+            cameras: StdRwLock::new(HashMap::new()),
         }
+    }
+
+    /// The camera's slot, cloned out of the map.
+    fn slot(&self, camera: &CameraId) -> Result<Arc<CameraSlot>, MediaError> {
+        read(&self.cameras)
+            .get(camera)
+            .cloned()
+            .ok_or_else(|| MediaError::UnknownCamera(camera.to_string()))
     }
 
     /// Stable per-camera path where the latest snapshot JPEG is kept for
@@ -265,16 +464,19 @@ impl GstPipelineRegistry {
     }
 
     /// Drop all mount points (called during graceful shutdown).
+    #[allow(
+        clippy::unused_async,
+        clippy::unused_async_trait_impl,
+        reason = "public signature kept: callers await it"
+    )]
     pub async fn shutdown(&self) {
-        let mut guard = self.state.write().await;
-        for (cam, entry) in guard.drain() {
-            self.server.remove_mount(&entry.mount_path);
-            if let Some(session) = entry.session {
-                session.video.abort();
-                session.audio.abort();
-                session.aac.abort();
+        let drained: Vec<(CameraId, Arc<CameraSlot>)> = write(&self.cameras).drain().collect();
+        for (cam, slot) in drained {
+            self.server.remove_mount(&slot.mount_path);
+            if let Some(session) = slot.end_session() {
+                session.abort();
             }
-            debug!(camera = %cam, mount = %entry.mount_path, "mount removed during shutdown");
+            debug!(camera = %cam, mount = %slot.mount_path, "mount removed during shutdown");
         }
     }
 }
@@ -328,9 +530,8 @@ impl GstPipelineRegistry {
                         if let Some(overlay) = &w.idle_overlay {
                             load_thumbnail_detached(overlay.clone(), thumb_path_for_cb.clone());
                         }
-                        if let (Some(text), Some(el)) =
-                            (lock(&caption_for_cb).as_deref(), &w.idle_caption)
-                        {
+                        let caption = lock(&caption_for_cb).clone(); // released at the `;`
+                        if let (Some(text), Some(el)) = (caption.as_deref(), &w.idle_caption) {
                             el.set_property("text", text);
                         }
                         // A client connected in the middle of a live
@@ -340,7 +541,8 @@ impl GstPipelineRegistry {
                             arm_live_switch(&w);
                             info!(camera = %cam_for_cb, "media built during a live session; live switch armed");
                         }
-                        *lock(&wiring_for_cb) = Some(w);
+                        let previous = lock(&wiring_for_cb).replace(w); // released at the `;`
+                        drop(previous); // the old media's objects go after the mutex
                         debug!(camera = %cam_for_cb, "captured live wiring from media");
                     }
                     Err(e) => {
@@ -387,29 +589,30 @@ impl PipelineRegistry for GstPipelineRegistry {
         let wiring: WiringSlot = Arc::new(StdMutex::new(None));
         let live_active = Arc::new(AtomicBool::new(false));
         let caption: CaptionSlot = Arc::new(StdMutex::new(None));
+        let slot = Arc::new(CameraSlot {
+            mount_path: outputs.rtsp_mount_path.clone(),
+            wiring: wiring.clone(),
+            live_active: live_active.clone(),
+            caption: caption.clone(),
+            worker: GstWorker::spawn(camera)?,
+            control: StdMutex::new(CameraControl {
+                idle: idle.clone(),
+                last_thumbnail: None,
+                session: None,
+                _hls: None,
+            }),
+        });
         // Claim the camera under a short write lock: a concurrent
         // registration of the same id stops at the entry, and the other
-        // cameras' attach/detach/thumbnail calls are not held up by the
-        // slow part below (directories, factory, segmenter thread). The
-        // entry is completed on success and removed on failure.
+        // cameras' calls are not held up by the slow part below
+        // (directories, factory, segmenter thread). The entry is completed
+        // on success and removed on failure.
         {
-            let mut state = self.state.write().await;
-            if state.contains_key(camera) {
+            let mut cameras = write(&self.cameras);
+            if cameras.contains_key(camera) {
                 return Err(MediaError::AlreadyRegistered(camera.to_string()));
             }
-            state.insert(
-                camera.clone(),
-                CameraEntry {
-                    mount_path: outputs.rtsp_mount_path.clone(),
-                    idle: idle.clone(),
-                    last_thumbnail: None,
-                    wiring: wiring.clone(),
-                    live_active: live_active.clone(),
-                    session: None,
-                    caption: caption.clone(),
-                    _hls: None,
-                },
-            );
+            cameras.insert(camera.clone(), Arc::clone(&slot));
         }
         let hooks = MediaHooks {
             wiring,
@@ -419,13 +622,11 @@ impl PipelineRegistry for GstPipelineRegistry {
         };
         match self.bring_up(camera, &idle, &launch, outputs, hooks).await {
             Ok(hls) => {
-                if let Some(entry) = self.state.write().await.get_mut(camera) {
-                    entry._hls = hls;
-                }
+                lock(&slot.control)._hls = hls;
                 Ok(())
             }
             Err(e) => {
-                self.state.write().await.remove(camera);
+                write(&self.cameras).remove(camera);
                 Err(e)
             }
         }
@@ -433,93 +634,76 @@ impl PipelineRegistry for GstPipelineRegistry {
 
     #[instrument(skip(self), fields(camera = %camera))]
     async fn attach_live_sink(&self, camera: &CameraId) -> Result<LiveSinks, MediaError> {
-        let mut guard = self.state.write().await;
-        let entry = guard
-            .get_mut(camera)
-            .ok_or_else(|| MediaError::UnknownCamera(camera.to_string()))?;
-        if entry.session.is_some() {
-            return Err(MediaError::Pipeline(format!(
-                "camera {camera} already in live mode"
-            )));
-        }
-
-        let (sinks, rxs) = LiveSinks::new();
-        let LiveSinkReceivers {
-            video: video_rx,
-            audio: audio_rx,
-            aac: aac_rx,
-        } = rxs;
-        // Flag first, then look: a media configured concurrently either
-        // sees the flag (and arms itself) or is already in the slot.
-        entry.live_active.store(true, Ordering::SeqCst);
-        if let Some(wiring) = lock(&entry.wiring).as_ref() {
-            arm_live_switch(wiring);
-        } else {
-            info!(
+        let slot = self.slot(camera)?;
+        let sinks = slot.begin_session(camera)?;
+        let wiring = Arc::clone(&slot.wiring);
+        let armed = slot
+            .worker
+            .run("arm live switch", move || {
+                let snapshot = lock(&wiring).clone(); // guard released at the `;`
+                match snapshot {
+                    Some(w) => {
+                        arm_live_switch(&w);
+                        true
+                    }
+                    None => false,
+                }
+            })
+            .await;
+        match armed {
+            Ok(true) => {}
+            Ok(false) => info!(
                 camera = %camera,
                 "no RTSP client connected yet; the live video is spliced in when one connects"
-            );
+            ),
+            Err(e) => {
+                // Leave nothing claimed: the next attach must not be refused.
+                if let Some(session) = slot.end_session() {
+                    session.abort();
+                }
+                return Err(e);
+            }
         }
-        let session = LiveSession {
-            video: spawn_live_pump(video_rx, entry.wiring.clone(), video_appsrc, "video"),
-            // Audio has no idle↔live selector — the audiomixer blends the
-            // live Opus onto silence; a media without the audio appsrc
-            // (pre-8b launch) simply discards it.
-            audio: spawn_live_pump(audio_rx, entry.wiring.clone(), audio_appsrc, "audio"),
-            aac: spawn_aac_pump(aac_rx, entry.wiring.clone()),
-        };
-        entry.session = Some(session);
-        info!(mount = %entry.mount_path, "live ingestion armed (video + audio)");
+        info!(mount = %slot.mount_path, "live ingestion armed (video + audio)");
         Ok(sinks)
     }
 
     #[instrument(skip(self), fields(camera = %camera))]
     async fn detach_live_sink(&self, camera: &CameraId) -> Result<(), MediaError> {
-        let mut guard = self.state.write().await;
-        let entry = guard
-            .get_mut(camera)
-            .ok_or_else(|| MediaError::UnknownCamera(camera.to_string()))?;
-
-        // Refresh the overlay clock so the standby timestamp updates
-        // the next time the synthetic IDR cycle inlines a frame.
-        entry.idle = Self::refresh_overlay_timestamp(&entry.idle);
-
-        let Some(session) = entry.session.take() else {
+        let slot = self.slot(camera)?;
+        let Some(session) = slot.end_session() else {
             debug!(camera = %camera, "detach_live_sink: no active session (idempotent no-op)");
             return Ok(());
         };
-        // Clear the flag before flipping back, so a media configured from
-        // now on starts (and stays) on the idle branch.
-        entry.live_active.store(false, Ordering::SeqCst);
-
-        let wiring_snapshot = lock(&entry.wiring).clone();
-        if let Some(wiring) = wiring_snapshot {
-            // A switch armed for a live frame that never came would
-            // otherwise wait on the pad (and fire on the next session's
-            // first frame out of turn).
-            if disarm_switch_probe(&wiring.sink_live, &wiring.live_switch) {
-                debug!("pending live switch removed: no live frame arrived");
-            }
-            // Synchronous flip on the video selector: raw I420 frames
-            // are independently complete, so any boundary works. A
-            // force-key-unit on the encoder gives clients a clean IDR
-            // right after the content swap.
-            wiring
-                .selector
-                .set_property("active-pad", &wiring.sink_idle);
-            force_keyframe(&wiring.encoder);
-            debug!("input-selector flipped to sink_0 (idle); IDR forced on encoder");
-        }
-
         // Aborting the pumps drops the receivers; the GStreamer
         // streaming thread's appsink callbacks see `LiveRtpSink::push`
         // return `false` and silently discard (no back-pressure). The
         // audiomixer stops receiving live buffers and reverts to the
         // silent bed — no explicit audio flip needed.
-        session.video.abort();
-        session.audio.abort();
-        session.aac.abort();
-        info!(mount = %entry.mount_path, "live ingestion released; idle restored");
+        session.abort();
+        let wiring = Arc::clone(&slot.wiring);
+        slot.worker
+            .run("restore idle", move || {
+                let snapshot = lock(&wiring).clone(); // guard released at the `;`
+                let Some(w) = snapshot else {
+                    return;
+                };
+                // A switch armed for a live frame that never came would
+                // otherwise wait on the pad (and fire on the next session's
+                // first frame out of turn).
+                if disarm_switch_probe(&w.sink_live, &w.live_switch) {
+                    debug!("pending live switch removed: no live frame arrived");
+                }
+                // Flip on the video selector: raw I420 frames are
+                // independently complete, so any boundary works. A key
+                // frame request gives clients a clean IDR right after the
+                // content swap.
+                w.selector.set_property("active-pad", &w.sink_idle);
+                request_keyframe(&w.encoder);
+                debug!("input-selector flipped to sink_0 (idle); key frame requested");
+            })
+            .await?;
+        info!(mount = %slot.mount_path, "live ingestion released; idle restored");
         Ok(())
     }
 
@@ -535,19 +719,11 @@ impl PipelineRegistry for GstPipelineRegistry {
         let path = self.thumbnail_file_path(camera);
         write_thumbnail_atomic(&path, &jpeg).await?;
 
-        // Take the overlay under the lock, decode without it: the load
-        // blocks for the decode, and attach/detach of every camera wait
-        // on this lock.
-        let overlay = {
-            let mut guard = self.state.write().await;
-            let entry = guard
-                .get_mut(camera)
-                .ok_or_else(|| MediaError::UnknownCamera(camera.to_string()))?;
-            entry.last_thumbnail = Some(jpeg);
-            lock(&entry.wiring)
-                .as_ref()
-                .and_then(|w| w.idle_overlay.clone())
-        };
+        let slot = self.slot(camera)?;
+        lock(&slot.control).last_thumbnail = Some(jpeg);
+        let overlay = lock(&slot.wiring)
+            .as_ref()
+            .and_then(|w| w.idle_overlay.clone());
 
         // Apply to the running media if one is up. If no client has
         // connected yet the file is already in place and the overlay
@@ -560,34 +736,37 @@ impl PipelineRegistry for GstPipelineRegistry {
             return Ok(());
         };
         let shown = path.clone();
-        tokio::task::spawn_blocking(move || apply_thumbnail_overlay(&overlay, &shown))
-            .await
-            .map_err(|e| MediaError::Pipeline(format!("thumbnail load task failed: {e}")))?;
+        // The decode blocks: it runs on the camera's control thread.
+        slot.worker
+            .run("apply thumbnail", move || {
+                apply_thumbnail_overlay(&overlay, &shown);
+            })
+            .await?;
         debug!(path = %path.display(), "thumbnail applied to idle overlay");
         Ok(())
     }
 
     async fn current_thumbnail(&self, camera: &CameraId) -> Result<Option<Bytes>, MediaError> {
-        let guard = self.state.read().await;
-        let entry = guard
-            .get(camera)
-            .ok_or_else(|| MediaError::UnknownCamera(camera.to_string()))?;
-        Ok(entry.last_thumbnail.clone())
+        let slot = self.slot(camera)?;
+        let thumbnail = lock(&slot.control).last_thumbnail.clone();
+        Ok(thumbnail)
     }
 
     async fn set_idle_caption(&self, camera: &CameraId, caption: String) -> Result<(), MediaError> {
-        let guard = self.state.read().await;
-        let entry = guard
-            .get(camera)
-            .ok_or_else(|| MediaError::UnknownCamera(camera.to_string()))?;
-        if let Some(el) = lock(&entry.wiring)
+        let slot = self.slot(camera)?;
+        // Store first, then look: a media configured concurrently either
+        // reads the new caption or is already in the slot.
+        *lock(&slot.caption) = Some(caption.clone());
+        let target = lock(&slot.wiring)
             .as_ref()
-            .and_then(|w| w.idle_caption.clone())
-        {
-            el.set_property("text", &caption);
+            .and_then(|w| w.idle_caption.clone());
+        if let Some(el) = target {
+            let text = caption.clone();
+            slot.worker
+                .run("set idle caption", move || el.set_property("text", &text))
+                .await?;
         }
         debug!(camera = %camera, %caption, "idle caption set");
-        *lock(&entry.caption) = Some(caption);
         Ok(())
     }
 }
@@ -614,10 +793,15 @@ fn attach_media_bus_watch(media: &RTSPMedia, camera: &CameraId, wiring: WiringSl
         // replaced it yet): the pumps then discard instead of pushing
         // into a torn-down appsrc.
         let element = media.element();
-        let mut slot = lock(&wiring);
-        if slot.as_ref().is_some_and(|w| w.media_element == element) {
-            *slot = None;
-        }
+        let stale = {
+            let mut slot = lock(&wiring);
+            if slot.as_ref().is_some_and(|w| w.media_element == element) {
+                slot.take()
+            } else {
+                None
+            }
+        };
+        drop(stale);
         warn!(camera = %cam_unprep, "RTSPMedia unprepared (pipeline torn down)");
     });
     let cam_state = camera.clone();
@@ -922,18 +1106,27 @@ fn arm_switch_probe(
         sink_live.remove_probe(old);
     }
     *slot = sink_live.add_probe(gst::PadProbeType::BUFFER, move |pad, _info| {
-        // Taking the id claims the switch; an empty slot means a detach
-        // took it first and the camera is no longer live.
-        if lock(&claim).take().is_none() {
+        // Streaming thread: never wait. A busy slot means an arm or a
+        // disarm is in progress; let this frame pass and decide on the next
+        // one. Taking the id claims the switch; an empty slot means a
+        // detach took it first and the camera is no longer live.
+        let claimed = match claim.try_lock() {
+            Ok(mut pending) => pending.take().is_some(),
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => {
+                poisoned.into_inner().take().is_some()
+            }
+            Err(std::sync::TryLockError::WouldBlock) => return gst::PadProbeReturn::Ok,
+        };
+        if !claimed {
             return gst::PadProbeReturn::Remove;
         }
         if let Some(selector) = selector.upgrade() {
             selector.set_property("active-pad", pad);
         }
         if let Some(encoder) = encoder.upgrade() {
-            force_keyframe(&encoder);
+            request_keyframe(&encoder);
         }
-        debug!("input-selector flipped to sink_1 (live); IDR forced on encoder");
+        debug!("input-selector flipped to sink_1 (live); key frame requested");
         gst::PadProbeReturn::Remove
     });
 }
@@ -948,16 +1141,22 @@ fn disarm_switch_probe(sink_live: &gst::Pad, pending: &PendingSwitch) -> bool {
     true
 }
 
-/// Dispatch a downstream `GstForceKeyUnit` event to the encoder so
-/// the next encoded frame is an IDR.
-fn force_keyframe(encoder: &gst::Element) {
-    let event = gst::event::CustomDownstream::new(
+/// Ask the encoder for a key frame without waiting for anything: an
+/// upstream `GstForceKeyUnit` on its src pad is not serialized, so it takes
+/// neither the encoder's state lock nor its stream lock. Safe from a pad
+/// probe and while the media changes state.
+fn request_keyframe(encoder: &gst::Element) {
+    let Some(src) = encoder.static_pad("src") else {
+        debug!("encoder has no src pad; no key frame requested");
+        return;
+    };
+    let event = gst::event::CustomUpstream::new(
         gst::Structure::builder("GstForceKeyUnit")
             .field("all-headers", true)
             .build(),
     );
-    let sent = encoder.send_event(event);
-    debug!(sent, "force-key-unit dispatched to encoder");
+    let sent = src.send_event(event);
+    debug!(sent, "key frame requested from the encoder");
 }
 
 /// Drain an RTP byte channel into the live `appsrc` of whichever media
@@ -1338,5 +1537,103 @@ mod tests {
         assert!(!huge.exists(), "the refused still is removed");
         assert!(sound.exists(), "a sound still is kept");
         let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    /// A call that never returns costs its caller the bound, not the
+    /// thread: the next call runs once the stuck one is released.
+    #[tokio::test]
+    async fn control_call_times_out_and_the_next_one_runs() {
+        let worker = GstWorker::spawn(&CameraId::new("T1")).unwrap();
+        let (release, blocked) = std::sync::mpsc::channel::<()>();
+        let stuck = worker
+            .run_within("stuck", Duration::from_millis(100), move || {
+                let _ = blocked.recv();
+            })
+            .await;
+        assert!(stuck.is_err(), "the caller gives up after its bound");
+
+        release.send(()).unwrap();
+        let next = worker.run("next", || 7_u32).await;
+        assert_eq!(
+            next.unwrap(),
+            7,
+            "the thread survived and runs the next call"
+        );
+    }
+
+    /// Behind a stuck call only `GST_WORKER_QUEUE` more may wait; the next
+    /// one is refused at once.
+    #[tokio::test]
+    async fn control_queue_refuses_when_full() {
+        let worker = GstWorker::spawn(&CameraId::new("T2")).unwrap();
+        let (release, blocked) = std::sync::mpsc::channel::<()>();
+        let stuck = worker
+            .run_within("stuck", Duration::from_millis(50), move || {
+                let _ = blocked.recv();
+            })
+            .await;
+        assert!(stuck.is_err());
+        for _ in 0..GST_WORKER_QUEUE {
+            // Queued behind the stuck call: each gives up waiting.
+            let waiting = worker
+                .run_within("queued", Duration::from_millis(5), || ())
+                .await;
+            assert!(waiting.is_err());
+        }
+        let refused = worker
+            .run_within("one too many", Duration::from_millis(5), || ())
+            .await
+            .unwrap_err();
+        assert!(
+            refused.to_string().contains("queue full"),
+            "refused at once: {refused}"
+        );
+        release.send(()).unwrap();
+    }
+
+    /// The key-frame request is an upstream event on the encoder's src pad:
+    /// it returns without any state or stream lock.
+    #[test]
+    fn key_frame_request_returns_at_once() {
+        let Some((_selector, _sink_idle, _sink_live, encoder)) = switch_fixture() else {
+            eprintln!("input-selector not available here; skipping");
+            return;
+        };
+        let (done, finished) = std::sync::mpsc::channel::<()>();
+        let worker = std::thread::spawn(move || {
+            request_keyframe(&encoder);
+            let _ = done.send(());
+        });
+        assert!(
+            finished.recv_timeout(Duration::from_secs(2)).is_ok(),
+            "request_keyframe must not wait"
+        );
+        worker.join().unwrap();
+    }
+
+    /// A frame that meets a busy slot (an arm or a disarm in progress)
+    /// passes un-switched; the next one switches.
+    #[test]
+    fn busy_switch_slot_lets_the_frame_pass() {
+        let Some((selector, sink_idle, sink_live, encoder)) = switch_fixture() else {
+            eprintln!("input-selector not available here; skipping");
+            return;
+        };
+        selector.set_state(gst::State::Paused).unwrap();
+        let pending = PendingSwitch::default();
+        arm_switch_probe(&sink_live, &selector, &encoder, &pending);
+
+        let held = lock(&pending);
+        let _ = sink_live.chain(gst::Buffer::new());
+        assert_eq!(
+            active_pad(&selector).as_ref(),
+            Some(&sink_idle),
+            "no flip while the slot is busy"
+        );
+        drop(held);
+
+        let _ = sink_live.chain(gst::Buffer::new());
+        assert_eq!(active_pad(&selector).as_ref(), Some(&sink_live));
+        selector.set_state(gst::State::Null).unwrap();
     }
 }
