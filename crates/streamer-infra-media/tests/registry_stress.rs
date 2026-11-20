@@ -165,7 +165,7 @@ fn start_rtp_source(sinks: Arc<StdMutex<HashMap<CameraId, LiveSinks>>>) -> gst::
             .new_sample(move |sink| {
                 let sample = sink.pull_sample().map_err(|_| gst::FlowError::Eos)?;
                 if let Some(list) = sample.buffer_list() {
-                    for buffer in list.iter() {
+                    for buffer in list {
                         feed(&sinks, buffer);
                     }
                 } else if let Some(buffer) = sample.buffer() {
